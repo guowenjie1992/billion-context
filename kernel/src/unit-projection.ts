@@ -165,6 +165,18 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
+  // #1592: the clamp discriminates a RE-FOLD (requested span already overlaps
+  // an active block → contain it so the old summary is replaceable) from a
+  // DRAG-IN (disjoint block → keep it out, the mega-turn killer). Shared
+  // passes carry the spans prebuilt; the single-shot apply path builds them
+  // inline like its other fallbacks, and only when coverage exists at all.
+  const clampIndexById =
+    byId ??
+    (input.preExistingCoverage.size > 0 ? buildIndexByMessageId(input.messages) : undefined);
+  const clampBlockSpans =
+    input.preExistingCoverage.size > 0
+      ? (shared?.blockSpans ?? buildBlockIndexSpans(input.state, clampIndexById!))
+      : undefined;
   const adjustedIds = clampAdjustmentAtCoverage(
     applyPairBoundaryAdjustments(resolved, input.messages, shared),
     resolved,
@@ -175,7 +187,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     // #5337 discipline: reuse the shared index map — the clamp runs on every
     // screened unit, and a per-call map rebuild would resurface the O(units×n)
     // quadratic the shared context exists to prevent.
-    byId,
+    clampIndexById,
+    clampBlockSpans,
   );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
@@ -805,6 +818,11 @@ export interface ProjectionShared {
   anchorMessage: CoreMessage | undefined;
   /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
   integrityPre: IntegrityPre;
+  /** Index spans [start..end] of every active block's effectiveMessageIds
+   *  over `messages`, sorted by start — the clampAdjustmentAtCoverage
+   *  refold-vs-drag discriminator. Rebuilding per unit is the #5337
+   *  quadratic class; one build serves the whole pass. Immutable. */
+  blockSpans: BlockIndexSpan[];
 }
 
 /** One-pass build of {@link ProjectionShared}; see that interface for what
@@ -833,8 +851,9 @@ export function buildProjectionShared(
       baseProtectedCallIds.add(msg.toolCallId);
     }
   }
+  const byId = buildIndexByMessageId(messages);
   return {
-    byId: buildIndexByMessageId(messages),
+    byId,
     liveCarrierIds,
     failedCompressCallIds,
     latestProtected,
@@ -844,7 +863,39 @@ export function buildProjectionShared(
     toolPairExtremes: buildToolPairExtremes(messages),
     anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
     integrityPre: buildIntegrityPre(messages),
+    blockSpans: buildBlockIndexSpans(state, byId),
   };
+}
+
+/** Contiguous index span [start..end] one active block covers over the
+ *  message array being projected. */
+export interface BlockIndexSpan {
+  start: number;
+  end: number;
+}
+
+/** Index intervals of every active block's effectiveMessageIds, sorted by
+ *  start. A block folds a contiguous history region, so min/max over its
+ *  covered ids is the region. Built once per pass (shared) or per apply
+ *  call (single-shot fallback) — never per screened unit. */
+function buildBlockIndexSpans(
+  state: CompressionState,
+  byId: Map<string, number>,
+): BlockIndexSpan[] {
+  const spans: BlockIndexSpan[] = [];
+  for (const block of activeBlocks(state)) {
+    let start: number | undefined;
+    let end: number | undefined;
+    for (const id of block.effectiveMessageIds ?? []) {
+      const idx = byId.get(id);
+      if (idx === undefined) continue;
+      if (start === undefined || idx < start) start = idx;
+      if (end === undefined || idx > end) end = idx;
+    }
+    if (start !== undefined && end !== undefined) spans.push({ start, end });
+  }
+  spans.sort((a, b) => a.start - b.start);
+  return spans;
 }
 
 /** tool-call/tool-result pairing map over a whole message array (a side may
@@ -945,6 +996,15 @@ function applyPairBoundaryAdjustments(
  * covered is the allowed reverse-split shape. The requested span itself is
  * NEVER clamped — only the adjustment's widening — so hand-built ranges that
  * deliberately target covered spans (refold candidates) keep resolving.
+ *
+ * #1592 refines the cut into a discriminator on the active block's span
+ * (blockSpans): a widened boundary that runs into a block the REQUESTED span
+ * already overlaps is a re-fold — the boundary must CONTAIN the block's span
+ * (push through to its far edge, or keep the deeper widening) so the old
+ * block is wholly re-folded and its summary replaced; cutting back would
+ * strand a partial overlap that renders as two stacked summaries. A block
+ * the requested span never touched is a pure drag-in — keep-out, exactly the
+ * pre-#1592 cut.
  */
 function clampAdjustmentAtCoverage(
   adjustedIds: string[],
@@ -954,6 +1014,12 @@ function clampAdjustmentAtCoverage(
   /** Shared id→index map (#5337): reuse the caller's O(n) derivation instead
    *  of rebuilding it per call on the screening hot path. */
   indexById?: Map<string, number>,
+  /** Index spans of the active blocks (#1592 discriminator): a widened
+   *  boundary that runs into a block the REQUESTED span already overlaps is
+   *  a re-fold and must CONTAIN the block; a block the requested span never
+   *  touched is a drag-in and stays out. Undefined (hand-built inputs,
+   *  coverage-free spans) keeps the pure keep-out behavior. */
+  blockSpans?: ReadonlyArray<BlockIndexSpan>,
 ): string[] {
   if (!coverage || coverage.size === 0 || adjustedIds.length === 0) {
     return adjustedIds;
@@ -979,23 +1045,67 @@ function clampAdjustmentAtCoverage(
     const id = messages[i]?.id;
     return id !== undefined && coverage.has(id);
   };
-  // Pull the widened TAIL back to just before the first covered member, and
-  // the widened HEAD forward likewise. Only the WIDENED portion is clamped —
-  // covered ids inside the requested span stay (refold/consumed semantics).
+  const spanAt = (i: number): BlockIndexSpan | undefined => {
+    if (!blockSpans) return undefined;
+    for (const span of blockSpans) {
+      if (i >= span.start && i <= span.end) return span;
+    }
+    return undefined;
+  };
+  // A partial overlap between the new fold's span and an active block's span
+  // cannot render: the block's own summary stays visible while the new fold
+  // emits a second one next to it (the #1592 round-2 stacked-shape break).
+  // The requested span is never clamped, so the resolution runs through the
+  // adjustment's widening, with the block spans as the discriminator:
+  //  - requested span overlaps the block → CONTAIN: push the widened
+  //    boundary to the block's far edge (or keep the deeper widening the
+  //    adjustment already produced) so the old block is wholly re-folded and
+  //    its summary replaced — the merge/refold semantics.
+  //  - requested span disjoint from the block → KEEP-OUT: pull the widened
+  //    boundary back before the block's near edge — the mega-turn killer
+  //    (nested/consumed machinery resolves the drag to fold-nothing).
+  const intersectsRequested = (span: BlockIndexSpan): boolean =>
+    resolved.startIndex <= span.end && resolved.endIndex >= span.start;
+  // Pull the widened TAIL back to just before the first covered member of a
+  // disjoint block, contain a re-folded one, and the widened HEAD likewise.
+  // Only the WIDENED portion is clamped — covered ids inside the requested
+  // span stay (refold/consumed semantics).
   let clamped = false;
-  for (let i = resolved.endIndex + 1; i <= endIdx; i++) {
-    if (isCovered(i)) {
-      endIdx = i - 1;
-      clamped = true;
-      break;
+  for (let i = resolved.endIndex + 1; i <= endIdx; ) {
+    if (!isCovered(i)) {
+      i++;
+      continue;
     }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (endIdx < span.end) {
+        endIdx = span.end;
+        clamped = true;
+      }
+      i = span.end + 1;
+      continue;
+    }
+    endIdx = i - 1;
+    clamped = true;
+    break;
   }
-  for (let i = resolved.startIndex - 1; i >= startIdx; i--) {
-    if (isCovered(i)) {
-      startIdx = i + 1;
-      clamped = true;
-      break;
+  for (let i = resolved.startIndex - 1; i >= startIdx; ) {
+    if (!isCovered(i)) {
+      i--;
+      continue;
     }
+    const span = spanAt(i);
+    if (span && intersectsRequested(span)) {
+      if (startIdx > span.start) {
+        startIdx = span.start;
+        clamped = true;
+      }
+      i = span.start - 1;
+      continue;
+    }
+    startIdx = i + 1;
+    clamped = true;
+    break;
   }
   if (!clamped) return adjustedIds;
   const ids: string[] = [];
